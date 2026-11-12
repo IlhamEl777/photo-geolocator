@@ -9,17 +9,23 @@ colours (a coarse YCbCr thumbnail) -- cheap colour/layout cues such as mean
 colour, sky/ground band colours, and green/sky/sand block shares.
 
 Those cues are matched against a reference set fitted on the competition's
-own 75 public practice photos (kit practice pool, answers published): the 8
-nearest reference photos in standardised feature space, blended with the
-fitted global prior anchor (the haversine-optimal point of the practice
-distribution, repeated 8 times as shrinkage). The guess is the spatial
-median of that blend.
+own 75 public practice photos (kit practice pool, answers published): the
+K_NN nearest reference photos in standardised feature space, each weighted
+1/(1+d) by its feature distance, blended with the fitted global prior
+anchor (weighted ANCH_W times the mean neighbour weight, as shrinkage).
+The guess is the weighted geometric median of that blend, computed on the
+sphere from 3-D unit vectors so it stays correct across the antimeridian.
 
-Calibration note: leave-one-instance-out validation on the practice pool
-(mean error, km) -- this model 7,610; global prior alone 7,610 (the cues do
-not beat the prior on 75 photos, so the blend is shrunk hard onto it);
-region oracle 2,420 (headroom if cues were stronger). Deterministic: no
-clock, no randomness, fixed neighbour count.
+Calibration note: leave-one-out validation on the practice pool (mean
+error, km) -- this model 6,843; global prior alone 6,843. The anchor was
+verified as the sample-optimal constant (a grid + refine search over all
+candidate points converges to it), and on 75 photos the colour cues carry
+no signal that beats it: ridge regression on the features, anchor-centroid
+blends, nearest-neighbour-distance gating and single-feature neighbour
+sets were all tried and scored 6,790-8,020, i.e. noise around or worse
+than the prior. The shrinkage therefore sits mid-plateau (ANCH_W = 5):
+the guess stays on the prior unless neighbour consensus is overwhelming.
+Deterministic: no clock, no randomness, fixed neighbour count.
 """
 import json, math, os, struct, sys, urllib.request
 
@@ -250,23 +256,46 @@ for _row in "115.83,128.12,121.47,152.72,119.79,83.68,132.42,119.59,121.80,125.3
     _v = [float(x) for x in _row.split(',')]
     REF.append((_v[:14], _v[14], _v[15]))
 
+K_NN = 5        # neighbours blended into each guess
+ANCH_W = 5.0    # prior-anchor weight, in units of the mean neighbour weight;
+                # LOO sweep: >=4 pins the median on the anchor plateau
+                # (6,843 km), 5.0 sits mid-plateau so only overwhelming
+                # neighbour consensus can move a guess off the prior
+
 def _spatial_median(pts):
-    x = sum(p[0] for p in pts)/len(pts); y = sum(p[1] for p in pts)/len(pts)
+    """Weighted geometric median on the sphere (unit-vector Weiszfeld).
+
+    pts are (lat, lon, weight). Working with 3-D unit vectors keeps the
+    median correct across the antimeridian, where averaging longitudes
+    directly can put the guess half a world away.
+    """
+    vs = []
+    for la, lo, w in pts:
+        lar, lor = math.radians(la), math.radians(lo)
+        vs.append(((math.cos(lar)*math.cos(lor), math.cos(lar)*math.sin(lor), math.sin(lar)), w))
+    tw = sum(w for _, w in vs)
+    x = tuple(sum(v[j]*w for v, w in vs)/tw for j in range(3))
     for _ in range(40):
-        nx = ny = den = 0.0
-        for a, b in pts:
-            d = max(1e-6, math.hypot(a-x, b-y))
-            nx += a/d; ny += b/d; den += 1/d
-        x, y = nx/den, ny/den
-    return (x, y)
+        nx = [0.0, 0.0, 0.0]; den = 0.0
+        for v, w in vs:
+            d = max(1e-9, math.sqrt(sum((v[j]-x[j])**2 for j in range(3))))
+            for j in range(3):
+                nx[j] += w*v[j]/d
+            den += w/d
+        x = tuple(nx[j]/den for j in range(3))
+        n = math.sqrt(sum(c*c for c in x))
+        x = tuple(c/n for c in x)
+    return (math.degrees(math.asin(x[2])), math.degrees(math.atan2(x[1], x[0])))
 
 def predict(feat):
     if feat is None:
         return ANCHOR
     def dist(rf):
         return sum(((feat[i]-rf[i])/SD[i])**2 for i in range(14))
-    near = sorted(REF, key=lambda r: dist(r[0]))[:8]
-    pts = [(la, lo) for _, la, lo in near] + [ANCHOR]*8
+    near = sorted(REF, key=lambda r: dist(r[0]))[:K_NN]
+    pts = [(la, lo, 1.0/(1.0+dist(rf))) for rf, la, lo in near]
+    mw = sum(p[2] for p in pts)/len(pts)
+    pts.append((ANCHOR[0], ANCHOR[1], ANCH_W*mw))
     return _spatial_median(pts)
 
 # ---------------- env loop ----------------
